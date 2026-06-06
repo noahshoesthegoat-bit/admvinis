@@ -1,0 +1,1043 @@
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TextService = game:GetService("TextService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Fsys
+pcall(function() Fsys = require(ReplicatedStorage:WaitForChild("Fsys")).load end)
+
+-- Safe thread identity
+local function getIdentity()
+    if type(get_thread_identity) == "function" then return get_thread_identity() end
+    if type(getthreadidentity) == "function" then return getthreadidentity() end
+    return 2
+end
+local function setIdentity(n)
+    if type(set_thread_identity) == "function" then pcall(set_thread_identity, n) return end
+    if type(setthreadidentity) == "function" then pcall(setthreadidentity, n) return end
+end
+
+-- Load modules
+local ClientData, RouterClient, InventoryDB, KindDB
+local DownloadClient, AnimationManager, PetNeonHelper
+local AilmentsClient, AilmentsDB, EquipPermissions
+local ClientToolManager, CharacterScale, InteriorsM, MusicModule
+pcall(function() ClientData = Fsys("ClientData") end)
+pcall(function() RouterClient = Fsys("RouterClient") end)
+pcall(function() InventoryDB = Fsys("InventoryDB") end)
+pcall(function() KindDB = Fsys("KindDB") end)
+pcall(function() DownloadClient = Fsys("DownloadClient") end)
+pcall(function() AnimationManager = Fsys("AnimationManager") end)
+pcall(function() PetNeonHelper = Fsys("PetNeonHelper") end)
+pcall(function() AilmentsClient = Fsys("new:AilmentsClient") end)
+pcall(function() AilmentsDB = Fsys("new:AilmentsDB") end)
+pcall(function() EquipPermissions = Fsys("EquipPermissions") end)
+pcall(function() ClientToolManager = Fsys("ClientToolManager") end)
+pcall(function() CharacterScale = Fsys("CharacterScale") end)
+pcall(function() InteriorsM = Fsys("InteriorsM") end)
+pcall(function() MusicModule = Fsys("Music") end)
+
+-- Spawner state
+local SpawnedPets = {}
+local PetModelCache = {}
+local EquippedPet = nil
+local CurrentRideId = nil
+local RideAnimationTrack = nil
+local PetAilmentsCache = {}
+local SpawnedItems = {}
+local MegaNeonConnections = {}
+local NextToyOrder = 60000
+local NewnessGroups = {
+    mega_neon_flyable_rideable=990000,mega_neon_flyable=980000,mega_neon_rideable=970000,mega_neon=960000,
+    neon_flyable_rideable=950000,neon_flyable=940000,neon_rideable=930000,neon=920000,
+    flyable_rideable=910000,flyable=900000,rideable=890000,regular=880000
+}
+
+local function GetPropertyGroup(p)
+    local M,N,F,R = p.mega_neon or false, p.neon or false, p.flyable or false, p.rideable or false
+    if M then
+        if F and R then return "mega_neon_flyable_rideable" elseif F then return "mega_neon_flyable" elseif R then return "mega_neon_rideable" else return "mega_neon" end
+    elseif N then
+        if F and R then return "neon_flyable_rideable" elseif F then return "neon_flyable" elseif R then return "neon_rideable" else return "neon" end
+    else
+        if F and R then return "flyable_rideable" elseif F then return "flyable" elseif R then return "rideable" else return "regular" end
+    end
+end
+
+local function UpdateClientData(key, fn)
+    local id = getIdentity()
+    setIdentity(2)
+    local data = ClientData.get(key)
+    local result = fn(table.clone(data))
+    ClientData.predict(key, result)
+    setIdentity(id)
+    return result
+end
+
+local function GenUID() return HttpService:GenerateGUID(false) end
+
+local function FindIn(arr, fn)
+    for i,v in pairs(arr) do if fn(v,i) then return i end end
+end
+
+local function FetchPetModel(kind)
+    if PetModelCache[kind] then return PetModelCache[kind] end
+    local m = DownloadClient.promise_download_copy("Pets", kind):expect()
+    PetModelCache[kind] = m
+    return m
+end
+
+local function StopMegaNeon(uid)
+    local c = MegaNeonConnections[uid]
+    if c then pcall(function() c:Disconnect() end) MegaNeonConnections[uid] = nil end
+end
+
+local function ApplyNeon(model, petData)
+    local mi = model:FindFirstChild("PetModel")
+    if not mi or not KindDB then return end
+    local kd = KindDB[petData.id]
+    if not kd then return end
+    if petData.properties.mega_neon then
+        local parts = kd.mega_neon_parts or kd.neon_parts
+        if parts then pcall(PetNeonHelper.apply_neon, mi, parts) end
+        StopMegaNeon(petData.unique)
+        local state = {}
+        local conn
+        conn = RunService.Heartbeat:Connect(function()
+            if mi and mi.Parent and mi:IsDescendantOf(workspace) then
+                pcall(PetNeonHelper.step_mega_neon, state, mi, kd)
+            else
+                if conn then conn:Disconnect() end
+                MegaNeonConnections[petData.unique] = nil
+            end
+        end)
+        MegaNeonConnections[petData.unique] = conn
+    elseif petData.properties.neon then
+        if kd.neon_parts then pcall(PetNeonHelper.apply_neon, mi, kd.neon_parts) end
+    end
+end
+
+local function RegWrapper(data)
+    UpdateClientData("pet_char_wrappers", function(w)
+        data.unique = #w+1
+        data.index = #w+1
+        w[#w+1] = data
+        return w
+    end)
+end
+
+local function RegState(data)
+    UpdateClientData("pet_state_managers", function(m)
+        m[#m+1] = data
+        return m
+    end)
+end
+
+local function RemWrapper(uid)
+    UpdateClientData("pet_char_wrappers", function(w)
+        local i = FindIn(w, function(v) return v.pet_unique == uid end)
+        if i then
+            table.remove(w, i)
+            for j = i, #w do w[j].unique = j w[j].index = j end
+        end
+        return w
+    end)
+end
+
+local function RemState(uid)
+    local pet = SpawnedPets[uid]
+    if not pet or not pet.model then return end
+    UpdateClientData("pet_state_managers", function(m)
+        local i = FindIn(m, function(v) return v.char == pet.model end)
+        if i then table.remove(m, i) end
+        return m
+    end)
+end
+
+local function ClearPetStates(uid)
+    local pet = SpawnedPets[uid]
+    if not pet or not pet.model then return end
+    UpdateClientData("pet_state_managers", function(m)
+        local i = FindIn(m, function(v) return v.char == pet.model end)
+        if i then
+            local u = table.clone(m)
+            u[i] = table.clone(u[i])
+            u[i].states = {}
+            return u
+        end
+        return m
+    end)
+end
+
+local function SetPetState(uid, sid)
+    local pet = SpawnedPets[uid]
+    if not pet or not pet.model then return end
+    UpdateClientData("pet_state_managers", function(m)
+        local i = FindIn(m, function(v) return v.char == pet.model end)
+        if i then
+            local u = table.clone(m)
+            u[i] = table.clone(u[i])
+            u[i].states = {{id=sid}}
+            return u
+        end
+        return m
+    end)
+end
+
+local function ClearPlayerStates()
+    UpdateClientData("state_manager", function(s)
+        local u = table.clone(s)
+        u.states = {}
+        u.is_sitting = false
+        return u
+    end)
+end
+
+local function SetPlayerState(sid)
+    UpdateClientData("state_manager", function(s)
+        local u = table.clone(s)
+        u.states = {{id=sid}}
+        u.is_sitting = true
+        return u
+    end)
+end
+
+local function AttachRide(model)
+    local char = LocalPlayer.Character
+    if not char or not char.PrimaryPart then return false end
+    local rp = model:FindFirstChild("RidePosition", true)
+    if not rp then return false end
+    local a = Instance.new("Attachment")
+    a.Parent = rp
+    a.Position = Vector3.new(0, 1.237, 0)
+    a.Name = "SourceAttachment"
+    local rc = Instance.new("RigidConstraint")
+    rc.Name = "StateConnection"
+    rc.Attachment0 = a
+    rc.Attachment1 = char.PrimaryPart.RootAttachment
+    rc.Parent = char
+    return true
+end
+
+local function Dismount()
+    if not CurrentRideId then return end
+    local pet = SpawnedPets[CurrentRideId]
+    if pet and pet.model then
+        if RideAnimationTrack then
+            RideAnimationTrack:Stop()
+            RideAnimationTrack:Destroy()
+            RideAnimationTrack = nil
+        end
+        local sa = pet.model:FindFirstChild("SourceAttachment", true)
+        if sa then sa:Destroy() end
+        local char = LocalPlayer.Character
+        if char then
+            for _,p in pairs(char:GetDescendants()) do
+                if p:IsA("BasePart") and p:GetAttribute("HaveMass") then
+                    p.Massless = false
+                end
+            end
+        end
+        ClearPetStates(CurrentRideId)
+        ClearPlayerStates()
+        pet.model:ScaleTo(1)
+    end
+    CurrentRideId = nil
+end
+
+local function Mount(uid, pState, petState)
+    local pet = SpawnedPets[uid]
+    if not pet or not pet.model then return end
+    local char = LocalPlayer.Character
+    if not char or not char.PrimaryPart or not char:FindFirstChild("Humanoid") then return end
+    Dismount()
+    CurrentRideId = uid
+    SetPetState(uid, petState)
+    SetPlayerState(pState)
+    pet.model:ScaleTo(2)
+    AttachRide(pet.model)
+    RideAnimationTrack = char.Humanoid.Animator:LoadAnimation(AnimationManager.get_track("PlayerRidingPet"))
+    char.Humanoid.Sit = true
+    for _,p in pairs(char:GetDescendants()) do
+        if p:IsA("BasePart") and p.Massless == false then
+            p.Massless = true
+            p:SetAttribute("HaveMass", true)
+        end
+    end
+    RideAnimationTrack:Play()
+end
+
+local function UnequipPet(petData)
+    local pet = SpawnedPets[petData.unique]
+    if not pet or not pet.model then return end
+    if CurrentRideId == petData.unique then Dismount() end
+    StopMegaNeon(petData.unique)
+    RemWrapper(petData.unique)
+    RemState(petData.unique)
+    pet.model:Destroy()
+    pet.model = nil
+    if EquippedPet and EquippedPet.unique == petData.unique then EquippedPet = nil end
+    PetAilmentsCache[petData.unique] = nil
+    task.wait(0.15)
+    if AilmentsClient then pcall(AilmentsClient.on_ailments_changed, LocalPlayer) end
+end
+
+local function EquipPet(petData, options)
+    if petData.category ~= "pets" then return end
+    if EquippedPet then UnequipPet(EquippedPet) end
+    for _,w in pairs(ClientData.get("pet_char_wrappers")) do
+        if w.controller == LocalPlayer then
+            pcall(function() RouterClient.get("ToolAPI/Unequip"):InvokeServer(w.pet_unique) end)
+        end
+    end
+    if not SpawnedPets[petData.unique] then
+        SpawnedPets[petData.unique] = {data=petData, model=nil}
+    else
+        SpawnedPets[petData.unique].data = petData
+    end
+    local model = FetchPetModel(petData.kind):Clone()
+    pcall(function() CharacterScale.scale_pet(model, 1) end)
+    if options and options.spawn_cframe then
+        pcall(function() model:PivotTo(options.spawn_cframe) end)
+        model:SetAttribute("HasSpawnCFrame", true)
+    end
+    model.Parent = workspace
+    SpawnedPets[petData.unique].model = model
+    ApplyNeon(model, petData)
+    EquippedPet = petData
+    local loc = nil
+    pcall(function() loc = InteriorsM and InteriorsM.get_current_location() end)
+    local destId = (loc and loc.destination_id) or "housing"
+    local fullDestId = (loc and loc.full_destination_id) or destId
+    local subDestId = loc and loc.sub_destination_id
+    task.defer(function()
+        RegWrapper({
+            char=model, mega_neon=petData.properties.mega_neon or false,
+            neon=petData.properties.neon or false, player=LocalPlayer,
+            entity_controller=LocalPlayer, controller=LocalPlayer,
+            rp_name=petData.properties.rp_name or "",
+            pet_trick_level=petData.properties.pet_trick_level or 0,
+            pet_unique=petData.unique, pet_id=petData.id,
+            location={full_destination_id=fullDestId, destination_id=destId, sub_destination_id=subDestId, house_owner=LocalPlayer},
+            pet_progression={age=petData.properties.age or 1, xp=petData.properties.xp or 0, friendship_level=1, friendship_xp=0, percentage=math.random(0,99)/100},
+            are_colors_sealed=false, is_pet=true,
+        })
+        RegState({char=model, player=LocalPlayer, store_key="pet_state_managers", is_sitting=false, chars_connected_to_me={}, states={}})
+        task.wait(0.1)
+        pcall(function()
+            UpdateClientData("pet_char_wrappers", function(w)
+                for _,v in pairs(w) do
+                    if v.pet_unique == petData.unique then v.rp_name = petData.properties.rp_name or "" end
+                end
+                return w
+            end)
+        end)
+        task.wait(0.15)
+        if AilmentsClient then pcall(AilmentsClient.on_ailments_changed, LocalPlayer) end
+    end)
+end
+
+-- Ailments override
+if ClientData then
+    local origGS = ClientData.get_server
+    ClientData.get_server = function(player, key, ...)
+        local data = origGS(player, key, ...)
+        if key == "ailments_manager" and player == LocalPlayer then
+            local ad = {}
+            if data then for k,v in pairs(data) do ad[k] = type(v)=="table" and table.clone(v) or v end end
+            ad.ailments = ad.ailments or {}
+            for uid,petInfo in pairs(SpawnedPets) do
+                if petInfo and petInfo.model then
+                    if PetAilmentsCache[uid] then
+                        ad.ailments[uid] = PetAilmentsCache[uid]
+                    else
+                        local types = {}
+                        if AilmentsDB then
+                            for k in pairs(AilmentsDB) do
+                                if k ~= "at_work" and k ~= "mystery" and k ~= "walking" then
+                                    table.insert(types, k)
+                                end
+                            end
+                        end
+                        local petAils = {}
+                        local used = {}
+                        for i = 1, math.min(3, #types) do
+                            local ak
+                            repeat ak = types[math.random(1, #types)] until not used[ak]
+                            used[ak] = true
+                            petAils[GenUID()] = {components={}, created_timestamp=os.time(), kind=ak, progress=0, rate=0, rate_timestamp=os.time(), sort_order=i*100}
+                        end
+                        PetAilmentsCache[uid] = petAils
+                        ad.ailments[uid] = petAils
+                    end
+                end
+            end
+            return ad
+        end
+        return data
+    end
+end
+
+if EquipPermissions then
+    local orig = EquipPermissions.can_equip_client
+    EquipPermissions.can_equip_client = function(item)
+        if item and item.unique and SpawnedPets[item.unique] then return true end
+        return orig(item)
+    end
+end
+
+if ClientToolManager then
+    local orig = ClientToolManager.equip
+    ClientToolManager.equip = function(item, options)
+        if item and item.unique and SpawnedPets[item.unique] and SpawnedPets[item.unique].data then
+            local fd = SpawnedPets[item.unique].data
+            for k,v in pairs(fd) do if item[k] == nil then item[k] = v end end
+        end
+        return orig(item, options)
+    end
+end
+
+if RouterClient then
+    local orig = RouterClient.get
+    RouterClient.get = function(ep)
+        if ep == "ToolAPI/Equip" then
+            return {InvokeServer=function(_,uid,opts)
+                local pet = SpawnedPets[uid]
+                if not pet then return orig("ToolAPI/Equip"):InvokeServer(uid,opts) end
+                EquipPet(pet.data, opts)
+                return true, {action="equip", is_server=true}
+            end}
+        elseif ep == "ToolAPI/Unequip" then
+            return {InvokeServer=function(_,uid)
+                local pet = SpawnedPets[uid]
+                if not pet then return orig("ToolAPI/Unequip"):InvokeServer(uid) end
+                UnequipPet(pet.data)
+                return true, {action="unequip", is_server=true}
+            end}
+        elseif ep == "AdoptAPI/RidePet" then
+            return {InvokeServer=function(_,pd)
+                local pet = SpawnedPets[pd.pet_unique]
+                if not pet then return orig("AdoptAPI/RidePet"):InvokeServer(pd) end
+                Mount(pd.pet_unique, "PlayerRidingPet", "PetBeingRidden")
+                return true
+            end}
+        elseif ep == "AdoptAPI/FlyPet" then
+            return {InvokeServer=function(_,pd)
+                local pet = SpawnedPets[pd.pet_unique]
+                if not pet then return orig("AdoptAPI/FlyPet"):InvokeServer(pd) end
+                Mount(pd.pet_unique, "PlayerFlyingPet", "PetBeingFlown")
+                return true
+            end}
+        elseif ep == "AdoptAPI/ExitSeatStates" then
+            return {FireServer=function()
+                if CurrentRideId then Dismount() return true end
+                return orig("AdoptAPI/ExitSeatStates"):FireServer()
+            end}
+        elseif ep == "SettingsAPI/SetPetRoleplayName" then
+            return {InvokeServer=function(_,uid,name)
+                local pet = SpawnedPets[uid]
+                if not pet then return orig("SettingsAPI/SetPetRoleplayName"):InvokeServer(uid,name) end
+                local id2 = getIdentity() setIdentity(2)
+                local inv = ClientData.get("inventory")
+                if inv and inv.pets and inv.pets[uid] then inv.pets[uid].properties.rp_name = name end
+                if pet.data then pet.data.properties.rp_name = name end
+                setIdentity(id2)
+                pcall(function()
+                    UpdateClientData("pet_char_wrappers", function(w)
+                        for _,v in pairs(w) do if v.pet_unique == uid then v.rp_name = name end end
+                        return w
+                    end)
+                end)
+                return true
+            end}
+        else
+            return orig(ep)
+        end
+    end
+end
+
+local function CreateItem(itemId, category, properties)
+    local uid = GenUID()
+    local kd = KindDB and KindDB[itemId]
+    properties = properties or {}
+    local nv = NextToyOrder
+    if category == "pets" then
+        local gk = GetPropertyGroup(properties)
+        NewnessGroups[gk] = NewnessGroups[gk] - 1
+        nv = NewnessGroups[gk]
+        properties.ailments_completed = properties.ailments_completed or 0
+        if properties.rp_name == nil then properties.rp_name = "" end
+        properties.xp = properties.xp or 0
+        properties.friendship_level = properties.friendship_level or 1
+        properties.friendship_xp = properties.friendship_xp or 0
+    else
+        NextToyOrder = NextToyOrder - 1
+        nv = NextToyOrder
+    end
+    local item = {unique=uid, category=category, id=itemId, kind=kd.kind, newness_order=nv, properties=properties, _source="AAPanel"}
+    local id2 = getIdentity() setIdentity(2)
+    local inv = ClientData.get("inventory")
+    if inv and inv[category] then inv[category][uid] = item end
+    setIdentity(id2)
+    if category == "pets" then SpawnedPets[uid] = {data=item, model=nil} end
+    SpawnedItems[uid] = true
+    task.defer(function()
+        local UIManager
+        pcall(function() UIManager = Fsys("UIManager") end)
+        if UIManager and UIManager.apps and UIManager.apps.BackpackApp then
+            UIManager.apps.BackpackApp:refresh_rendered_items()
+        end
+    end)
+    return item
+end
+
+local function findItem(name)
+    if not InventoryDB then return nil,nil,nil end
+    local nameLower = name:lower()
+    for _,cat in ipairs({"pets","toys","food","vehicles","strollers","gifts"}) do
+        local tbl = InventoryDB[cat]
+        if type(tbl) == "table" then
+            for id,v in pairs(tbl) do
+                if type(v) == "table" then
+                    -- Match by display name OR by kind/id key
+                    if (v.name and v.name:lower() == nameLower) or id:lower() == nameLower then
+                        return id, cat, v
+                    end
+                end
+            end
+        end
+    end
+    return nil,nil,nil
+end
+
+-- Location sync
+task.spawn(function()
+    local lastLoc
+    while task.wait(0.5) do
+        local cur
+        pcall(function() cur = InteriorsM and InteriorsM.get_current_location() end)
+        local id = cur and cur.full_destination_id
+        if id ~= lastLoc then
+            lastLoc = id
+            pcall(function()
+                UpdateClientData("pet_char_wrappers", function(w)
+                    for i,v in ipairs(w) do
+                        if v.controller == LocalPlayer and v.is_pet then
+                            w[i] = table.clone(v)
+                            w[i].location = {
+                                full_destination_id = cur.full_destination_id or cur.destination_id,
+                                destination_id = cur.destination_id,
+                                sub_destination_id = cur.sub_destination_id,
+                                house_owner = v.location and v.location.house_owner or LocalPlayer
+                            }
+                        end
+                    end
+                    return w
+                end)
+            end)
+            if AilmentsClient then pcall(AilmentsClient.on_ailments_changed, LocalPlayer) end
+        end
+    end
+end)
+
+
+-- Ticker system
+local activeEvents = {}
+local tickerContainers = {}
+local tickerConnections = {}
+local currentEntries = {}
+
+local function h2c(h)
+    h = h:gsub("#","")
+    return Color3.new(tonumber(h:sub(1,2),16)/255, tonumber(h:sub(3,4),16)/255, tonumber(h:sub(5,6),16)/255)
+end
+
+local function mkg(c)
+    if #c == 1 then local x = h2c(c[1]) return ColorSequence.new(x,x) end
+    local k = {}
+    for i,v in ipairs(c) do k[i] = ColorSequenceKeypoint.new((i-1)/(#c-1), h2c(v)) end
+    return ColorSequence.new(k)
+end
+
+local function mkLbl(e, w, ct)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(0,w,1,0)
+    l.BackgroundTransparency = 1
+    l.Text = e.text
+    l.TextColor3 = Color3.new(1,1,1)
+    l.Font = Enum.Font.FredokaOne
+    l.TextSize = 24
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.LayoutOrder = 9999
+    l.ZIndex = 6
+    l.Parent = ct
+    local g = Instance.new("UIGradient")
+    g.Color = mkg(e.colors)
+    g.Parent = l
+    local s = Instance.new("UIStroke")
+    s.Thickness = 2
+    s.Color = Color3.new(0,0,0)
+    s.Parent = l
+end
+
+local function rebuildTickers()
+    local appGui = PlayerGui:FindFirstChild("AdminChatApp")
+    if not appGui then
+        appGui = Instance.new("ScreenGui")
+        appGui.Name = "AdminChatApp"
+        appGui.ResetOnSpawn = false
+        appGui.DisplayOrder = 10
+        appGui.Parent = PlayerGui
+    end
+    appGui.Enabled = true
+    for _,v in ipairs(appGui:GetChildren()) do
+        if v.Name == "_FakeTicker" then v:Destroy() end
+    end
+    for _,c in ipairs(tickerConnections) do c:Disconnect() end
+    tickerConnections = {}
+    tickerContainers = {}
+    if #currentEntries == 0 then return end
+    local PADDING = 20
+    local cycleWidth = 0
+    for _,e in ipairs(currentEntries) do
+        e.width = TextService:GetTextSize(e.text, 24, Enum.Font.FredokaOne, Vector2.new(math.huge,math.huge)).X
+        cycleWidth = cycleWidth + e.width + PADDING
+    end
+    local function makeTicker(isBottom)
+        local aY = isBottom and 1 or 0
+        local fr = Instance.new("Frame")
+        fr.Name = "_FakeTicker"
+        fr.Size = UDim2.new(1,0,0,40)
+        fr.AnchorPoint = Vector2.new(0.5,aY)
+        fr.Position = UDim2.fromScale(0.5,aY)
+        fr.BackgroundColor3 = Color3.new(0,0,0)
+        fr.BackgroundTransparency = 0.75
+        fr.BorderSizePixel = 0
+        fr.ClipsDescendants = true
+        fr.ZIndex = 9
+        fr.Parent = appGui
+        local ct = Instance.new("Frame")
+        ct.BackgroundTransparency = 1
+        ct.Size = UDim2.new(0,cycleWidth*2,1,0)
+        ct.ZIndex = 10
+        ct.Parent = fr
+        table.insert(tickerContainers, ct)
+        local ll = Instance.new("UIListLayout")
+        ll.FillDirection = Enum.FillDirection.Horizontal
+        ll.Padding = UDim.new(0,PADDING)
+        ll.SortOrder = Enum.SortOrder.LayoutOrder
+        ll.Parent = ct
+        for _=1,2 do
+            for _,e in ipairs(currentEntries) do mkLbl(e,e.width,ct) end
+        end
+        ct.Position = UDim2.fromOffset(isBottom and -(cycleWidth/2) or 0, 0)
+        local conn = RunService.Heartbeat:Connect(function(dt)
+            if not ct.Parent then return end
+            local x = ct.Position.X.Offset - 80*dt
+            if x <= -cycleWidth then x = x + cycleWidth end
+            ct.Position = UDim2.fromOffset(x, 0)
+        end)
+        table.insert(tickerConnections, conn)
+    end
+    makeTicker(false)
+    makeTicker(true)
+end
+
+local function spawnTickers(entries)
+    currentEntries = entries
+    rebuildTickers()
+end
+
+local function addToTickers(entry)
+    table.insert(currentEntries, entry)
+    rebuildTickers()
+end
+
+local AE = {
+    super_speed        = {text="Super Speed!",               colors={"FAC822","FA9617","F96A0D","F83800"}},
+    low_gravity        = {text="Low Gravity!",               colors={"6A359C","804FB3","9969C7"}},
+    multiplier_3x      = {text="3x Bucks and Aging!",        colors={"8CD864","4AC655","208C35"}},
+    xp_rain            = {text="XP is raining!",             colors={"FF605D","ff9f63"}},
+    double_egg_rewards = {text="Double Egg Rewards!",        colors={"10f2fa","14a8f8"}},
+    fly_ride_any_pet   = {text="Ride & Fly Any Pet!",        colors={"F3E0B0","FFFDD0","F7DBEC"}},
+    stars              = {text="See Admins at the Main Map!",colors={"FF9AE4","FF87DE","DD99FF"}},
+    shutdown_warning   = {text="Servers restarting soon!",   colors={"FFFFFF"}},
+}
+local RAINBOW = {"FF4845","FF605D","F5FF63","95FF4F","50FF9F","4E2FFF","A061FF","FF61BD","FF6565"}
+
+-- Command handler
+local function handleCmd(msg)
+    local t = msg:gsub("^%s+",""):gsub("%s+$","")
+    local l = t:lower()
+
+    if l == "teleport/gold/me" then
+        task.spawn(function()
+            pcall(function()
+                local interiors = workspace:FindFirstChild("Interiors")
+                if interiors then
+                    for _,c in ipairs(interiors:GetChildren()) do
+                        if c.Name == "MainMap!Default" or c.Name:lower():find("mainmap") then
+                            c.Name = "AdminAbuseGold"
+                            break
+                        end
+                    end
+                end
+            end)
+            if MusicModule then
+                pcall(function() MusicModule.play(99,{id="rbxassetid://80082589176421",volume=0.25,name="AdminAbuseMusic"}) end)
+            end
+            spawnTickers({AE.multiplier_3x, AE.xp_rain})
+        end)
+        return
+    end
+
+    -- adminabuseevent/item_rain/<kind>[/age_N][/neon][/mega][/fly][/ride][/temporary][/untradeable]
+    local itemArgs = t:match("^[Aa][Dd][Mm][Ii][Nn][Aa][Bb][Uu][Ss][Ee][Ee][Vv][Ee][Nn][Tt]/item[^/]+/(.+)$")
+    if itemArgs then
+        local isRain = t:lower():find("/item_rain/") ~= nil
+        task.spawn(function()
+            local parts = {}
+            for p in itemArgs:gmatch("[^/]+") do table.insert(parts, p) end
+            local itemName = parts[1]:lower()
+            local age = 6
+            local neon, mega, fly, ride = false, false, true, true
+            local temporary, untradeable = false, false
+            local friendship = 1
+            for i = 2, #parts do
+                local p = parts[i]:lower()
+                local ageNum = p:match("^age_(%d+)$")
+                local friendNum = p:match("^friendship_(%d+)$")
+                if ageNum then age = tonumber(ageNum) or 6
+                elseif friendNum then friendship = tonumber(friendNum) or 1
+                elseif p == "neon" then neon = true
+                elseif p == "mega" or p == "mega_neon" then mega = true neon = false
+                elseif p == "fly" or p == "flyable" then fly = true
+                elseif p == "ride" or p == "rideable" then ride = true
+                elseif p == "nofly" then fly = false
+                elseif p == "noride" then ride = false
+                elseif p == "temporary" then temporary = true
+                elseif p == "untradeable" then untradeable = true
+                end
+            end
+            local itemId, itemCat, itemEntry = findItem(itemName)
+            local name = (itemEntry and itemEntry.name) or itemName
+            local text = isRain and ("It's raining: "..name.."!") or ("You got a free "..name.."! Check your Backpack!")
+            addToTickers({text=text, colors=RAINBOW})
+            local props = {neon=neon,mega_neon=mega,flyable=fly,rideable=ride,age=age,pet_trick_level=5,trick_level=5,ailments_completed=0,rp_name="",xp=0,friendship_level=friendship,friendship_xp=0}
+            if temporary then props.temporary = true end
+            if untradeable then props.untradeable = true end
+            local ok, err = pcall(function()
+                local UIManager
+                pcall(function() UIManager = Fsys("UIManager") end)
+                local DialogApp = UIManager and UIManager.apps and UIManager.apps.DialogApp
+                local kd = KindDB and KindDB[itemId]
+                if not kd then return end
+                local response = DialogApp:dialog({
+                    dialog_type = "ItemPreviewDialog",
+                    text = "An Adopt Me admin gave you: ",
+                    item = {id=itemId, name=name, category=itemCat or "pets", kind=kd.kind, properties=props},
+                    button = "Okay!",
+                    yields = true,
+                })
+                if response == "Okay!" and itemId then
+                    local newItem = CreateItem(itemId, itemCat or "pets", props)
+                end
+            end)
+            if not ok then warn("[AAP] error:", err) end
+        end)
+        return
+    end
+
+    local kind = t:match("^[Aa][Dd][Mm][Ii][Nn][Aa][Bb][Uu][Ss][Ee][Ee][Vv][Ee][Nn][Tt]/(.+)$")
+    if kind then
+        kind = kind:lower()
+        local entry = AE[kind]
+        if activeEvents[kind] then return end
+        activeEvents[kind] = true
+        if kind == "super_speed" then
+            task.spawn(function()
+                local char = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+                pcall(function() char:WaitForChild("Humanoid").WalkSpeed = 35 end)
+            end)
+        elseif kind == "low_gravity" then
+            pcall(function() workspace.Gravity = 50 end)
+        end
+        addToTickers(entry)
+        return
+    end
+
+    if l == "teleport/housing/me" then
+        if InteriorsM then pcall(function() InteriorsM.enter_smooth("housing","MainDoor",{house_owner=LocalPlayer}) end) end
+        return
+    end
+
+    local housingUser = t:match("^[Tt]eleport/[Hh]ousing/(.+)$")
+    if housingUser and housingUser:lower() ~= "me" then
+        local p = game:GetService("Players"):FindFirstChild(housingUser)
+        if p and InteriorsM then pcall(function() InteriorsM.enter_smooth("housing","MainDoor",{house_owner=p}) end) end
+        return
+    end
+
+    local tpUser = t:match("^[Tt]eleport/[Tt][Pp]/(.+)$")
+    if tpUser then
+        task.spawn(function()
+            local target = game:GetService("Players"):FindFirstChild(tpUser)
+            if not target then return end
+            local loc
+            local ClientData2
+            pcall(function() ClientData2 = Fsys("ClientData") end)
+            if ClientData2 then
+                pcall(function()
+                    local raw = ClientData2.get_server(target,"char_wrapper_raw")
+                    if raw and raw.location then loc = raw.location end
+                end)
+            end
+            if loc and loc.full_destination_id and InteriorsM then
+                local dest = loc.full_destination_id
+                local owner = loc.house_owner
+                pcall(function()
+                    if dest:lower():sub(1,7) == "housing" and owner then
+                        InteriorsM.enter_smooth("housing","MainDoor",{house_owner=owner})
+                    else
+                        InteriorsM.enter_smooth(dest,"MainDoor",{})
+                    end
+                end)
+                task.wait(1.5)
+                local myChar = LocalPlayer.Character
+                local targetChar = target.Character
+                if myChar and targetChar then
+                    local hrp = targetChar:FindFirstChild("HumanoidRootPart")
+                    local myHrp = myChar:FindFirstChild("HumanoidRootPart")
+                    if hrp and myHrp then myHrp.CFrame = hrp.CFrame * CFrame.new(2,0,0) end
+                end
+            end
+        end)
+        return
+    end
+
+    local dest, user = t:match("^[Tt]eleport/([^/]+)/(.+)$")
+    if dest and user then
+        task.spawn(function()
+            if InteriorsM then
+                local owner = nil
+                if user:lower() ~= "me" then
+                    local p = game:GetService("Players"):FindFirstChild(user)
+                    if p then owner = p end
+                end
+                pcall(function() InteriorsM.enter_smooth(dest,"MainDoor", owner and {house_owner=owner} or {}) end)
+            end
+        end)
+        return
+    end
+end
+
+-- Hook chat
+pcall(function() LocalPlayer.Chatted:Connect(handleCmd) end)
+task.spawn(function()
+    local TCS = game:GetService("TextChatService")
+    local channels
+    for i=1,100 do
+        channels = TCS:FindFirstChild("TextChannels")
+        if channels then break end
+        task.wait(0.1)
+    end
+    if not channels then return end
+    local function hookCh(ch)
+        if not ch:IsA("TextChannel") then return end
+        ch.MessageReceived:Connect(function(msg)
+            if not msg then return end
+            local src = msg.TextSource
+            if src and src.UserId == LocalPlayer.UserId then handleCmd(msg.Text) end
+        end)
+    end
+    for _,ch in ipairs(channels:GetChildren()) do hookCh(ch) end
+    channels.ChildAdded:Connect(hookCh)
+end)
+
+-- Destroy old GUI
+local existing = PlayerGui:FindFirstChild("AdminAbusePanelGui")
+if existing then existing:Destroy() end
+
+-- GUI
+local gui = Instance.new("ScreenGui")
+gui.Name = "AdminAbusePanelGui"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 99
+gui.Parent = PlayerGui
+
+local root = Instance.new("Frame")
+root.Size = UDim2.fromOffset(400,500)
+root.Position = UDim2.new(0.5,-200,0.5,-250)
+root.BackgroundColor3 = Color3.fromRGB(12,12,16)
+root.BorderSizePixel = 0
+root.Active = true
+root.Draggable = true
+root.Visible = true
+root.Parent = gui
+Instance.new("UICorner",root).CornerRadius = UDim.new(0,10)
+
+local tb = Instance.new("Frame")
+tb.Size = UDim2.new(1,0,0,44)
+tb.BackgroundColor3 = Color3.fromRGB(20,20,28)
+tb.BorderSizePixel = 0
+tb.Parent = root
+Instance.new("UICorner",tb).CornerRadius = UDim.new(0,10)
+
+local tbfix = Instance.new("Frame")
+tbfix.Size = UDim2.new(1,0,0,10)
+tbfix.Position = UDim2.new(0,0,1,-10)
+tbfix.BackgroundColor3 = Color3.fromRGB(20,20,28)
+tbfix.BorderSizePixel = 0
+tbfix.Parent = tb
+
+local acc = Instance.new("Frame")
+acc.Size = UDim2.new(1,0,0,2)
+acc.Position = UDim2.new(0,0,1,0)
+acc.BackgroundColor3 = Color3.fromRGB(250,180,30)
+acc.BorderSizePixel = 0
+acc.Parent = tb
+
+local ag = Instance.new("UIGradient")
+ag.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,Color3.fromRGB(250,180,30)),
+    ColorSequenceKeypoint.new(0.5,Color3.fromRGB(255,120,10)),
+    ColorSequenceKeypoint.new(1,Color3.fromRGB(220,60,0)),
+})
+ag.Parent = acc
+
+local tl = Instance.new("TextLabel")
+tl.Size = UDim2.new(1,-90,1,0)
+tl.Position = UDim2.fromOffset(12,0)
+tl.BackgroundTransparency = 1
+tl.Text = "⚡ AdminAbuse Panel"
+tl.TextSize = 14
+tl.Font = Enum.Font.GothamBold
+tl.TextColor3 = Color3.fromRGB(235,235,235)
+tl.TextXAlignment = Enum.TextXAlignment.Left
+tl.Parent = tb
+
+local cb = Instance.new("TextButton")
+cb.Size = UDim2.fromOffset(28,28)
+cb.Position = UDim2.new(1,-36,0.5,-14)
+cb.BackgroundColor3 = Color3.fromRGB(200,50,50)
+cb.Text = "✕"
+cb.TextSize = 12
+cb.Font = Enum.Font.GothamBold
+cb.TextColor3 = Color3.new(1,1,1)
+cb.BorderSizePixel = 0
+cb.Parent = tb
+Instance.new("UICorner",cb).CornerRadius = UDim.new(0,6)
+cb.MouseButton1Click:Connect(function() root.Visible = false end)
+
+UserInputService.InputBegan:Connect(function(i,p)
+    if p then return end
+    if i.KeyCode == Enum.KeyCode.RightAlt then root.Visible = not root.Visible end
+end)
+
+local scroll = Instance.new("ScrollingFrame")
+scroll.Size = UDim2.new(1,-16,1,-56)
+scroll.Position = UDim2.fromOffset(8,52)
+scroll.BackgroundTransparency = 1
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 3
+scroll.ScrollBarImageColor3 = Color3.fromRGB(250,180,30)
+scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scroll.CanvasSize = UDim2.new(0,0,0,0)
+scroll.Parent = root
+
+local sl = Instance.new("UIListLayout")
+sl.Padding = UDim.new(0,5)
+sl.Parent = scroll
+
+local sp = Instance.new("UIPadding")
+sp.PaddingLeft = UDim.new(0,4)
+sp.PaddingRight = UDim.new(0,4)
+sp.PaddingTop = UDim.new(0,6)
+sp.Parent = scroll
+
+local sections = {
+    {title="🌍 Teleport", color=Color3.fromRGB(80,160,255), cmds={
+        {cmd="teleport/housing/me",          desc="Your own house"},
+        {cmd="teleport/housing/<username>",  desc="Player's house"},
+        {cmd="teleport/tp/<username>",       desc="Teleport to player"},
+        {cmd="teleport/<destID>/me",         desc="Any interior by ID"},
+        {cmd="teleport/<destID>/<username>", desc="Interior with house owner"},
+    }},
+    {title="⚡ AdminAbuse Gold", color=Color3.fromRGB(250,180,30), cmds={
+        {cmd="teleport/gold/me", desc="Music + sky rename + tickers"},
+    }},
+    {title="🎮 AdminAbuse Events", color=Color3.fromRGB(200,100,255), cmds={
+        {cmd="adminabuseevent/super_speed",        desc="WalkSpeed 35"},
+        {cmd="adminabuseevent/low_gravity",        desc="Gravity 50"},
+        {cmd="adminabuseevent/multiplier_3x",      desc="3x Bucks ticker"},
+        {cmd="adminabuseevent/xp_rain",            desc="XP raining ticker"},
+        {cmd="adminabuseevent/double_egg_rewards", desc="Double eggs ticker"},
+        {cmd="adminabuseevent/fly_ride_any_pet",   desc="Ride & fly ticker"},
+        {cmd="adminabuseevent/stars",              desc="See admins ticker"},
+        {cmd="adminabuseevent/shutdown_warning",   desc="Shutdown warning ticker"},
+    }},
+    {title="🎁 Item Events", color=Color3.fromRGB(255,120,120), cmds={
+        {cmd="adminabuseevent/item_handout/<name>[/age_N][/neon][/mega][/fly][/ride][/friendship_N]", desc="e.g. item_handout/blue_dog/age_6/mega/fly/ride/friendship_5"},
+        {cmd="adminabuseevent/item_rain/<name>[/age_N][/neon][/mega]",                 desc="e.g. item_rain/bat_dragon/neon"},
+    }},
+}
+
+local order = 0
+for _,sec in ipairs(sections) do
+    order += 1
+    local hdr = Instance.new("TextLabel")
+    hdr.Size = UDim2.new(1,0,0,26)
+    hdr.BackgroundColor3 = Color3.fromRGB(22,22,30)
+    hdr.BorderSizePixel = 0
+    hdr.Text = "  "..sec.title
+    hdr.TextSize = 11
+    hdr.Font = Enum.Font.GothamBold
+    hdr.TextColor3 = sec.color
+    hdr.TextXAlignment = Enum.TextXAlignment.Left
+    hdr.LayoutOrder = order
+    hdr.Parent = scroll
+    Instance.new("UICorner",hdr).CornerRadius = UDim.new(0,6)
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(0,3,1,0)
+    bar.BackgroundColor3 = sec.color
+    bar.BorderSizePixel = 0
+    bar.Parent = hdr
+    Instance.new("UICorner",bar).CornerRadius = UDim.new(0,2)
+    for _,c in ipairs(sec.cmds) do
+        order += 1
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1,0,0,42)
+        row.BackgroundColor3 = Color3.fromRGB(18,18,24)
+        row.BorderSizePixel = 0
+        row.LayoutOrder = order
+        row.Parent = scroll
+        Instance.new("UICorner",row).CornerRadius = UDim.new(0,6)
+        local cl = Instance.new("TextLabel")
+        cl.Size = UDim2.new(1,-12,0,20)
+        cl.Position = UDim2.fromOffset(10,4)
+        cl.BackgroundTransparency = 1
+        cl.Text = c.cmd
+        cl.TextSize = 11
+        cl.Font = Enum.Font.Code
+        cl.TextColor3 = Color3.fromRGB(255,220,100)
+        cl.TextXAlignment = Enum.TextXAlignment.Left
+        cl.TextTruncate = Enum.TextTruncate.AtEnd
+        cl.Parent = row
+        local dl = Instance.new("TextLabel")
+        dl.Size = UDim2.new(1,-12,0,16)
+        dl.Position = UDim2.fromOffset(10,22)
+        dl.BackgroundTransparency = 1
+        dl.Text = c.desc
+        dl.TextSize = 10
+        dl.Font = Enum.Font.Gotham
+        dl.TextColor3 = Color3.fromRGB(140,140,150)
+        dl.TextXAlignment = Enum.TextXAlignment.Left
+        dl.Parent = row
+    end
+end
+
